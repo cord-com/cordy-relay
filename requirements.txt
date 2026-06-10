@@ -1,0 +1,5 @@
+anthropic>=0.91.0
+slack-bolt>=1.21
+python-dotenv>=1.0
+markdown-to-mrkdwn
+requests
