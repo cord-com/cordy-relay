@@ -9,9 +9,11 @@ cloud. It only needs a WebSocket to Slack and HTTPS to Anthropic.
 """
 import os
 import re
+import base64
 import sqlite3
 import threading
 
+import requests
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from markdown_to_mrkdwn import SlackMarkdownConverter
@@ -21,7 +23,13 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 load_dotenv()
 
 client = Anthropic()
-app = App(token=os.environ["SLACK_BOT_TOKEN"])
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+app = App(token=SLACK_BOT_TOKEN)
+
+# Image types Claude accepts. Slack files carry a mimetype we can check.
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_IMAGES_PER_TURN = 5            # keep sessions sane
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # Claude's per-image ceiling
 mrkdwn = SlackMarkdownConverter()
 
 AGENT = {
@@ -95,7 +103,45 @@ def relay_stream(session_id: str, channel: str, thread_ts: str) -> None:
         pass  # file delivery is best-effort
 
 
-def run_turn(channel: str, thread_ts: str, user: str, text: str) -> None:
+def extract_images(event: dict) -> list[dict]:
+    """Download any image files attached to a Slack event and return them as
+    Claude image content blocks. Slack files sit behind an authenticated URL,
+    so we fetch with the bot token. Needs the files:read scope.
+    """
+    blocks = []
+    for f in event.get("files", []) or []:
+        if len(blocks) >= MAX_IMAGES_PER_TURN:
+            break
+        mimetype = f.get("mimetype", "")
+        if mimetype not in SUPPORTED_IMAGE_TYPES:
+            continue  # skip PDFs, docs, etc. - images only for now
+        url = f.get("url_private_download") or f.get("url_private")
+        if not url:
+            continue
+        try:
+            resp = requests.get(
+                url, headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.content
+            if len(data) > MAX_IMAGE_BYTES:
+                continue  # too big for Claude; skip rather than fail the turn
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mimetype,
+                    "data": base64.standard_b64encode(data).decode("ascii"),
+                },
+            })
+        except Exception:
+            continue  # one bad file shouldn't sink the whole message
+    return blocks
+
+
+def run_turn(channel: str, thread_ts: str, user: str, text: str,
+             images: list[dict] | None = None) -> None:
     try:
         session_id = get_session(channel, thread_ts)
         if session_id is None:
@@ -108,11 +154,15 @@ def run_turn(channel: str, thread_ts: str, user: str, text: str) -> None:
             )
             session_id = session.id
             save_session(channel, thread_ts, session_id)
+
+        # Text first, then any images, in one user message.
+        content = [{"type": "text", "text": f"<@{user}> asks: {text}"}]
+        if images:
+            content.extend(images)
+
         client.beta.sessions.events.send(
             session_id,
-            events=[{"type": "user.message",
-                     "content": [{"type": "text",
-                                  "text": f"<@{user}> asks: {text}"}]}],
+            events=[{"type": "user.message", "content": content}],
         )
         relay_stream(session_id, channel, thread_ts)
     except Exception as e:
@@ -129,13 +179,16 @@ def on_mention(event, ack, context):
     user = event.get("user", "someone")
     text = re.sub(rf"<@{context['bot_user_id']}>", "",
                   event.get("text", "")).strip()
-    if not text:
+    images = extract_images(event)
+    if not text and not images:
         post(channel, thread_ts, f"Hi <@{user}> — what can I do for you?")
         return
+    if not text and images:
+        text = "(see attached image(s))"
     app.client.reactions_add(channel=channel, name="eyes",
                              timestamp=event["ts"])
     threading.Thread(target=run_turn,
-                     args=(channel, thread_ts, user, text)).start()
+                     args=(channel, thread_ts, user, text, images)).start()
 
 
 @app.event("message")
@@ -154,10 +207,12 @@ def on_message(event, ack):
     # Thread replies continue an existing session without a re-mention.
     thread_ts = event.get("thread_ts")
     if thread_ts and get_session(event["channel"], thread_ts):
+        images = extract_images(event)
         threading.Thread(
             target=run_turn,
             args=(event["channel"], thread_ts,
-                  event.get("user", "someone"), event.get("text", "")),
+                  event.get("user", "someone"),
+                  event.get("text", "") or "(see attached image(s))", images),
         ).start()
 
 
